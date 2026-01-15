@@ -1,5 +1,5 @@
 # Targeting Alignment: Extracting Safety Classifiers of Aligned LLMs
-This repository contains the code for the paper "Targeting Alignment: Extracting Safety Classifiers of Aligned LLMs" by Jean-Charles Noirot Ferrand, Yohan Beugin, Eric Pauley, Ryan Sheatsley, and Patrick McDaniel, accepted at . The paper is available on [arXiv](https://arxiv.org/abs/2501.16534).
+This repository contains the code for the paper "Targeting Alignment: Extracting Safety Classifiers of Aligned LLMs" by Jean-Charles Noirot Ferrand, Yohan Beugin, Eric Pauley, Ryan Sheatsley, and Patrick McDaniel, accepted to IEEE SaTML 2026. The paper is available on [arXiv](https://arxiv.org/abs/2501.16534).
 
 ![Overview of the approach](./docs/overview.png)
 
