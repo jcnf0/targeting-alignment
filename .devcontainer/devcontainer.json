@@ -6,8 +6,8 @@
 		"dockerfile": "../Dockerfile",
 		"target": "vscode_dev" // Allow to use debugging/viz tools.
 	},
-	// "runArgs": ["--gpus", "all"],
-	// Target the mount to a specific folder in the container to avoid conflicts with the default user settings.
+	// "runArgs": ["--gpus", "all"], // Set this flag if you have GPUs
+	// Target the mount to a specific folder in tue container to avoid conflicts with the default user settings.
 	"workspaceFolder": "/workspace",
 	"mounts": [
         "source=${localWorkspaceFolder},target=/workspace,type=bind",
@@ -16,7 +16,8 @@
 
 	// Set environment variables.
 	"containerEnv":{
-		"HF_HOME": "/workspace/.cache/huggingface" // Prevents redownloading models when container is stopped
+		"HF_HOME": "/workspace/.cache/huggingface", // Prevents redownloading models when container is stopped
+		"DATA_DIR": "/workspace/data/embeddings" // Where the embeddings will be stored
 	},
 	
 	"customizations": {

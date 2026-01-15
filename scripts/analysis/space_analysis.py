@@ -5,10 +5,11 @@ import os
 import polars as pl
 import torch
 import torch.multiprocessing as mp
-from clfextract.datasets import ParquetManager
 from sklearn.decomposition import PCA
 from sklearn.metrics import silhouette_score
 from sklearn.preprocessing import StandardScaler
+
+from clfextract.datasets import ParquetManager
 
 
 def get_args():
@@ -24,7 +25,7 @@ def get_args():
     parser.add_argument(
         "--attacks",
         type=str,
-        required=True,
+        default="benign",
         help="Attacks to analyze (comma-separated)",
     )
     parser.add_argument(
@@ -40,9 +41,7 @@ def get_args():
     parser.add_argument(
         "--n_components", type=int, default=2, help="Number of PCA components"
     )
-    parser.add_argument(
-        "--sequential", action="store_true", help="Run sequentially instead of parallel"
-    )
+    parser.add_argument("--parallel", action="store_true")
     return parser.parse_args()
 
 
@@ -164,8 +163,6 @@ def process_layer(args, layer, data_cache):
         results["pca"]["silhouette_y_pca"].append(float(silhouette_y_pca))
         results["pca"]["silhouette_y_pred_pca"].append(float(silhouette_y_pred_pca))
 
-    print(f"Layer results: {results}")
-
     return results
 
 
@@ -187,16 +184,12 @@ if __name__ == "__main__":
         lens_type,
         attacks=["benign"],
         source=args.source,
-        data_dir=args.input
+        data_dir=args.input,
     )
 
     print("Data loaded.")
 
-    if args.sequential:
-        combined_results = []
-        for layer in range(args.start_layer, args.end_layer + 1):
-            combined_results.append(process_layer(args, layer, data_cache))
-    else:
+    if args.parallel:
         # Process layers in parallel
         with mp.Pool(processes=args.end_layer - args.start_layer + 1) as pool:
             combined_results = pool.starmap(
@@ -206,11 +199,18 @@ if __name__ == "__main__":
                     for layer in range(args.start_layer, args.end_layer + 1)
                 ],
             )
+    else:
+        combined_results = []
+        for layer in range(args.start_layer, args.end_layer + 1):
+            combined_results.append(process_layer(args, layer, data_cache))
 
-    output_filename = (
-        args.output
-        + f"space_analysis_{args.source}_{args.model}_layer{args.start_layer:02d}-{args.end_layer:02d}_{args.attacks}.json"
+    output_filename = os.path.join(
+        args.output,
+        f"space_analysis_{args.source}_{args.model}_layer{args.start_layer:02d}-{args.end_layer:02d}_{args.attacks}.json",
     )
+
+    if not os.path.exists(args.output):
+        os.makedirs(args.output)
 
     with open(output_filename, "w") as f:
         json.dump(combined_results, f, indent=4)

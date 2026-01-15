@@ -2,18 +2,18 @@ from setuptools import find_packages, setup
 
 # Core dependencies required for basic functionality
 CORE_DEPS = [
-    "numpy",
-    "pandas",
-    "transformers>=4.40",
-    "accelerate",
-    "torch",
-    "typing",
-    "fschat",
-    "sentencepiece",
-    "protobuf",
-    "argparse",
-    "scikit-learn",
-    "statsmodels",
+    "accelerate==1.7.0",
+    "fschat==0.2.36",
+    "numpy==1.26.3",
+    "pandas==2.2.3",
+    "protobuf==6.31.0",
+    "pynvml==12.0.0",  # To measure GPU VRAM usage
+    "scikit-learn==1.6.1",
+    "sentencepiece==0.2.0",
+    "torch==2.7.0",
+    "torchvision==0.22.0",  # Fixes torchvision version for imports
+    "transformers==4.52.3",
+    "typing==3.7.4.3",
 ]
 
 # Optional dependencies for visualization and interactive usage
@@ -28,7 +28,7 @@ POLARS_DEPS = {
 setup(
     name="clfextract",
     version="0.1.0",
-    description="A framework to extract safety classifiers of LLMs.",
+    description="Source code for Targeting Alignment: Extracting Safety Classifiers of Aligned LLMs",
     author="Jean-Charles Noirot Ferrand",
     author_email="jcnf@cs.wisc.edu",
     python_requires=">=3.10",

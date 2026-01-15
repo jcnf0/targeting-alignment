@@ -1,7 +1,10 @@
 import inspect
+import threading
+import time
 from functools import wraps
 from typing import Union, get_args, get_origin, get_type_hints
 
+import pynvml
 import torch
 from accelerate import find_executable_batch_size
 
@@ -117,99 +120,70 @@ def get_all_args(class_or_method, args_and_kwargs: dict):
     return args, kwargs
 
 
-def silhouette_score(X, labels, loss=False, metric="euclidean"):
-    if type(labels) != type(torch.HalfTensor()):
-        labels = torch.HalfTensor(labels)
-    if not labels.is_cuda:
-        labels = labels.cuda()
-
-    if type(X) != type(torch.HalfTensor()):
-        X = torch.HalfTensor(X)
-    if not X.is_cuda:
-        X = X.cuda()
-
-    unique_labels = torch.unique(labels)
-
-    A = _intra_cluster_distances_block(
-        X, labels, unique_labels, metric=metric, device=X.device
-    )
-    B = _nearest_cluster_distance_block(
-        X, labels, unique_labels, metric=metric, device=X.device
-    )
-    sil_samples = (B - A) / torch.maximum(A, B)
-
-    # nan values are for clusters of size 1, and should be 0
-    mean_sil_score = torch.mean(torch.nan_to_num(sil_samples))
-    if loss:
-        return -mean_sil_score
-    else:
-        return float(mean_sil_score.cpu().numpy())
+def get_model_tag(model_path: str) -> str:
+    match model_path.lower():
+        case path if "llama-2" in path:
+            return "llama2"
+        case path if "llama-3" in path:
+            return "llama3"
+        case path if "gemma-2" in path:
+            return "gemma2"
+        case path if "gemma-7b" in path:
+            return "gemma1"
+        case path if "qwen2" in path:
+            return "qwen2"
+        case path if "mistral" in path:
+            return "mistral"
+        case path if "zephyr_rmu" in path:
+            return "zephyrrmu"
+        case path if "granite" in path:
+            return "granite"
+        case _:
+            return model_path.lower().split("/")[-1]
 
 
-def _intra_cluster_distances_block(
-    X, labels, unique_labels, metric="euclidean", device="cuda:0"
-):
-    intra_dist = torch.zeros(labels.size(), dtype=torch.float32, device=device)
-    values = [
-        _intra_cluster_distances_block_(
-            X[torch.where(labels == label)[0]], metric=metric
+class VRAMMonitor:
+    def __init__(self, device_id=0, interval=0.1):
+        self.device_id = device_id
+        self.interval = interval
+        self.vram_usages = []
+        self._running = False
+        self._thread = None
+        pynvml.nvmlInit()
+        self.handle = pynvml.nvmlDeviceGetHandleByIndex(self.device_id)
+
+    def _monitor(self):
+        while self._running:
+            try:
+                info = pynvml.nvmlDeviceGetMemoryInfo(self.handle)
+                self.vram_usages.append(info.used / (1024**2))  # Convert to MB
+            except pynvml.NVMLError as error:
+                print(f"NVML Error: {error}")
+                break
+            time.sleep(self.interval)
+
+    def start(self):
+        self.vram_usages = []
+        self._running = True
+        self._thread = threading.Thread(target=self._monitor)
+        self._thread.daemon = (
+            True  # Allow the program to exit even if thread is running
         )
-        for label in unique_labels
-    ]
-    for label, values_ in zip(unique_labels, values):
-        intra_dist[torch.where(labels == label)[0]] = values_
-    return intra_dist
+        self._thread.start()
 
+    def stop(self):
+        self._running = False
+        if self._thread:
+            self._thread.join()
+        pynvml.nvmlShutdown()  # Shut down NVML when done with monitoring
 
-def _intra_cluster_distances_block_(subX, metric="euclidean"):
-    if metric == "euclidean":
-        distances = torch.cdist(subX, subX)
-        return distances.sum(axis=1) / (distances.shape[0] - 1)
-    elif metric == "cosine":
-        subX = torch.nn.functional.normalize(subX, p=2, dim=-1)
-        distances = 1 - torch.matmul(subX, subX.transpose(-1, -2))
-    return distances.sum(axis=1) / (distances.shape[0] - 1)
-
-
-def _nearest_cluster_distance_block(
-    X, labels, unique_labels, metric="euclidean", device="cuda:0"
-):
-    inter_dist = torch.full(
-        labels.size(), torch.inf, dtype=torch.float32, device=device
-    )
-    label_combinations = torch.combinations(unique_labels, 2)
-
-    values = [
-        _nearest_cluster_distance_block_(
-            X[torch.where(labels == label_a)[0]],
-            X[torch.where(labels == label_b)[0]],
-            metric=metric,
-        )
-        for label_a, label_b in label_combinations
-    ]
-
-    for (label_a, label_b), (values_a, values_b) in zip(label_combinations, values):
-
-        indices_a = torch.where(labels == label_a)[0]
-        inter_dist[indices_a] = torch.minimum(values_a, inter_dist[indices_a])
-        del indices_a
-        indices_b = torch.where(labels == label_b)[0]
-        inter_dist[indices_b] = torch.minimum(values_b, inter_dist[indices_b])
-        del indices_b
-    return inter_dist
-
-
-def _nearest_cluster_distance_block_(subX_a, subX_b, metric="euclidean"):
-    if metric == "euclidean":
-        dist = torch.cdist(subX_a, subX_b)
-    elif metric == "cosine":
-        subX_a = torch.nn.functional.normalize(subX_a, p=2, dim=-1)
-        subX_b = torch.nn.functional.normalize(subX_b, p=2, dim=-1)
-        dist = 1 - torch.matmul(subX_a, subX_b.transpose(-1, -2))
-
-    dist_a = dist.mean(axis=1)
-    dist_b = dist.mean(axis=0)
-    return dist_a, dist_b
+    def get_vram_stats(self):
+        if not self.vram_usages:
+            return {"low": 0, "high": 0, "average": 0}
+        return {
+            "low": min(self.vram_usages),
+            "high": max(self.vram_usages),
+        }
 
 
 def savefig(path, size=[4, 3]):

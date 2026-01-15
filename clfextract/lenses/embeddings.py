@@ -68,25 +68,15 @@ class EmbeddingLens(Lens):
     ) -> torch.Tensor:
         """
         Computes the context for the given input.
-
-        Args:
-            batch_size (int): The batch size for processing the input.
-            input (Union[str, List[str], torch.Tensor]): The input text or batch of texts.
-
-        Returns:
-            torch.Tensor: The computed contextual embeddings.
-
         """
         assert (
             input is not None or inputs_embeds is not None or input_ids is not None
         ), "Input tensor or embeddings must be provided"
 
         if input is not None:
-            input = [input] if isinstance(input, str) else input
             inputs = self.tokenizer(input, return_tensors="pt", padding=True).to(
                 self.model.device
             )
-            # Use attention mask to get the prompt length
             lengths = torch.sum(inputs.attention_mask, dim=1).cpu().numpy()
             num_inputs = inputs.input_ids.shape[0]
             max_length = inputs.input_ids.shape[1]
@@ -96,6 +86,12 @@ class EmbeddingLens(Lens):
             lengths = None
             num_inputs = inputs.shape[0]
             max_length = inputs.shape[1]
+            # Ensure the tensor for inputs is on the correct device and requires grad if it's the one we're optimizing
+            # This is implicitly handled when input_ids/inputs_embeds come from `optim_ids_onehot` which requires grad.
+            if input_ids is not None:
+                inputs = inputs.to(self.model.device)
+            elif inputs_embeds is not None:
+                inputs = inputs.to(self.model.device)
 
         positions = (
             [i for i in range(max_length)] if self.positions is None else self.positions
@@ -109,44 +105,51 @@ class EmbeddingLens(Lens):
                 self.model.config.hidden_size,
             ),
             device=self.model.device,
+            dtype=self.model.dtype,  # Ensure consistent dtype
         )
 
+        # Iterate in batches to handle large inputs
         for i in range(0, num_inputs, batch_size):
             if input is not None:
                 batch_inputs = {
                     k: v[i : min(i + batch_size, num_inputs)] for k, v in inputs.items()
                 }
-                output = self.model(**batch_inputs)
+                # Ensure output_hidden_states=True to get all layer outputs
+                output = self.model(**batch_inputs, output_hidden_states=True)
 
             elif input_ids is not None:
-                batch_inputs = inputs[i : min(i + batch_size, num_inputs), :]
+                batch_input_ids = inputs[i : min(i + batch_size, num_inputs), :]
+                # Ensure output_hidden_states=True
                 output = self.model(
-                    input_ids=batch_inputs, attention_mask=attention_mask
+                    input_ids=batch_input_ids,
+                    attention_mask=attention_mask,
+                    output_hidden_states=True,
                 )
 
             elif inputs_embeds is not None:
-                batch_inputs = inputs[i : min(i + batch_size, num_inputs), :, :]
+                batch_inputs_embeds = inputs[i : min(i + batch_size, num_inputs), :, :]
+                # Ensure output_hidden_states=True
                 output = self.model(
-                    inputs_embeds=batch_inputs, attention_mask=attention_mask
+                    inputs_embeds=batch_inputs_embeds,
+                    attention_mask=attention_mask,
+                    output_hidden_states=True,
                 )
 
             hidden_states = output.hidden_states
 
             for j, layer in enumerate(self.layers):
+                # Ensure that `emb` is assigned a slice that retains its grad_fn.
+                # Direct slicing is usually fine, but confirm `hidden_states[layer]` still has grad_fn.
+                # If `hidden_states[layer]` is a tuple/list of tensors and you want the last, ensure it's selected.
                 emb[i : min(i + batch_size, num_inputs), j, :] = (
                     hidden_states[layer][:, :]
                     if self.positions is None
                     else hidden_states[layer][:, positions, :]
                 )
 
-            # Delete hidden_states to free up memory
-            del hidden_states
-            torch.cuda.empty_cache()
-
-        if self.requires_grad_:
-            emb.requires_grad_()
-
         if return_numpy:
+            # Only detach if you truly need a numpy array.
+            # For GCG, you need gradients, so this path should ideally not be taken.
             emb = emb.cpu().detach().numpy()
 
         if self.positions is None and lengths is not None and return_numpy and unpad:
@@ -335,366 +338,3 @@ class KVLens(Lens):
 
     def distance(self) -> float:
         raise NotImplementedError("Distance not implemented for KVLens")
-
-
-def pruned_forward(
-    model,
-    layer_ids: List[int],
-    input_ids: Optional[torch.Tensor] = None,
-    inputs_embeds: Optional[torch.Tensor] = None,
-    position_ids: Optional[torch.Tensor] = None,
-    keep_all_layers: bool = True,
-    keep_conversion_layer: bool = True,
-) -> List[torch.Tensor]:
-    """
-    Forward pass through the model with pruned layers.
-    Args:
-        model (Model): The model to forward pass through.
-        input_ids (torch.Tensor): The input tensor.
-        layers (List[int]): The layers to forward pass through.
-        position_ids (torch.Tensor): The position IDs for the input tensor.
-    Returns:
-        List[torch.Tensor]: The hidden states from the specified layers.
-    """
-    assert isinstance(input_ids, torch.Tensor) or isinstance(
-        inputs_embeds, torch.Tensor
-    ), "Input tensor or embeddings must be provided"
-    assert (
-        min(layer_ids) >= 0 and max(layer_ids) < model.config.num_hidden_layers
-    ), "Invalid layer(s) specified"
-    assert len(layer_ids) > 0, "No layers specified"
-    assert (
-        isinstance(position_ids, torch.Tensor) or position_ids is None
-    ), "Position IDs must be a tensor or None"
-    layer_ids.sort()
-    # Get the embeddings
-    if input_ids is not None:
-        inputs_embeds = model.embed_tokens(
-            input_ids
-        )  # TODO : Generalize to all models?
-        # Prepare attention mask
-        attention_mask = torch.ones_like(input_ids)
-        bsz, seq_len = input_ids.size()
-        position_ids = (
-            torch.arange(seq_len, dtype=torch.long, device=input_ids.device)
-            .unsqueeze(0)
-            .expand(bsz, -1)
-            if position_ids is None
-            else position_ids
-        )
-
-    elif inputs_embeds is not None and input_ids is None:
-        attention_mask = torch.ones(
-            inputs_embeds.size()[:2], device=inputs_embeds.device, dtype=torch.int64
-        )
-        bsz, seq_len, _ = inputs_embeds.size()
-        position_ids = (
-            torch.arange(seq_len, dtype=torch.long, device=inputs_embeds.device)
-            .unsqueeze(0)
-            .expand(bsz, -1)
-            if position_ids is None
-            else position_ids
-        )
-
-    # Prepare causal mask
-    causal_mask = model._update_causal_mask(
-        attention_mask,
-        inputs_embeds,
-        torch.arange(seq_len, device=inputs_embeds.device),
-        None,  # past_key_values
-        False,  # output_attentions
-    )
-
-    layer_kwargs = {
-        "attention_mask": causal_mask,
-        "position_ids": position_ids,
-        "past_key_value": None,
-        "output_attentions": False,
-        "use_cache": False,
-        "cache_position": None,
-    }
-
-    # Generate position embeddings
-    if hasattr(model, "rotary_emb") and model.rotary_emb is not None:
-        position_embeddings = model.rotary_emb(
-            inputs_embeds, position_ids
-        )  # Llama specific
-        layer_kwargs["position_embeddings"] = position_embeddings
-    # Start with the input embeddings as hidden states
-    hidden_states = inputs_embeds
-    # List to store all hidden states
-    all_hidden_states = (
-        [hidden_states] if keep_all_layers and keep_conversion_layer else []
-    )
-    # Forward pass through specified layers
-
-    for layer in [model.layers[l] for l in layer_ids]:
-        layer_outputs = layer(
-            hidden_states,
-            **layer_kwargs,
-        )
-        hidden_states = layer_outputs[0]
-        if keep_all_layers:
-            all_hidden_states.append(hidden_states)
-        elif not keep_all_layers and model.layers[-1] == layer:
-            all_hidden_states.append(hidden_states)
-
-    # Final layer norm if the last layer is not pruned
-    if layer_ids[-1] == len(model.layers) - 1 and model.norm is not None:
-        hidden_states = model.norm(hidden_states)
-        all_hidden_states[-1] = hidden_states
-
-    return all_hidden_states
-
-
-def truncated_forward(
-    model,
-    start_layer: int,
-    end_layer: Optional[int] = None,
-    input_ids: Optional[torch.Tensor] = None,
-    inputs_embeds: Optional[torch.Tensor] = None,
-    position_ids: Optional[torch.Tensor] = None,
-    keep_all_layers: bool = True,
-    keep_conversion_layer: bool = True,
-):
-    """
-    Forward pass through the model from a specified layer to another specified layer.
-    Args:
-        model (Model): The model to forward pass through.
-        input_ids (torch.Tensor): The input tensor.
-        start_layer (int): The layer to start from.
-        end_layer (int): The layer to end at.
-        position_ids (torch.Tensor): The position IDs for the input tensor.
-    Returns:
-        List[torch.Tensor]: The hidden states from the specified layers.
-    """
-    assert isinstance(input_ids, torch.Tensor) or isinstance(
-        inputs_embeds, torch.Tensor
-    ), "Input tensor or embeddings must be provided"
-    assert (
-        start_layer >= 0 and start_layer < model.config.num_hidden_layers
-    ), f"Invalid start_layer, must be between 0 and {model.config.num_hidden_layers} ({start_layer} was provided)"
-    assert end_layer is None or (
-        start_layer <= end_layer and end_layer < model.config.num_hidden_layers
-    ), f"Invalid end_layer, must be between {start_layer} and {model.config.num_hidden_layers-1} ({end_layer} was provided)"
-
-    end_layer = model.config.num_hidden_layers - 1 if end_layer is None else end_layer
-    layer_ids = [l for l in range(start_layer, end_layer + 1)]
-
-    if input_ids is not None:
-        return pruned_forward(
-            model,
-            layer_ids,
-            input_ids=input_ids,
-            position_ids=position_ids,
-            keep_all_layers=keep_all_layers,
-            keep_conversion_layer=keep_conversion_layer,
-        )
-    else:
-        return pruned_forward(
-            model,
-            layer_ids,
-            inputs_embeds=inputs_embeds,
-            position_ids=position_ids,
-            keep_all_layers=keep_all_layers,
-            keep_conversion_layer=keep_conversion_layer,
-        )
-
-
-class PrunedEmbeddingLens(EmbeddingLens):
-    @type_check
-    def __init__(
-        self,
-        model,
-        tokenizer,
-        layers: Optional[List[int]] = None,
-        keep_conversion_layer: bool = True,
-        **kwargs,
-    ):
-
-        assert (
-            min(layers) >= 0 and max(layers) < model.config.num_hidden_layers
-        ), "Invalid layer(s) specified"
-        if layers is None:
-            print("Warning: No layers specified. Defaulting to all layers.")
-            layers = [l for l in range(model.config.num_hidden_layers)]
-
-        super().__init__(
-            model,
-            tokenizer,
-            layers=layers,
-            **kwargs,
-        )
-
-        self.keep_conversion_layer = keep_conversion_layer
-
-    @find_executable_batch_size
-    def __call__(
-        batch_size,
-        self,
-        input: Union[str, List[str], torch.Tensor],
-        return_numpy: bool = False,
-        unpad: bool = False,
-    ) -> torch.Tensor:
-        """
-        Computes the context for the given input.
-
-        Args:
-            batch_size (int): The batch size for processing the input.
-            input (Union[str, List[str], torch.Tensor]): The input text or batch of texts.
-
-        Returns:
-            torch.Tensor: The computed contextual embeddings.
-
-        """
-        assert (
-            isinstance(input, str)
-            or isinstance(input, list)
-            or isinstance(input, torch.Tensor)
-        ), "Input must be a string, a list of strings, or a tensor"
-
-        if isinstance(input, torch.Tensor):
-            inputs = input
-            lengths = None
-        else:
-            input = [input] if isinstance(input, str) else input
-            inputs = self.tokenizer(input, return_tensors="pt", padding=True).to(
-                self.model.device
-            )
-            # Use attention mask to get the prompt length
-            lengths = torch.sum(inputs.attention_mask, dim=1).cpu().numpy()
-
-        positions = (
-            [i for i in range(inputs.input_ids.shape[1])]
-            if self.positions is None
-            else self.positions
-        )
-
-        emb = torch.zeros(
-            (
-                inputs.input_ids.shape[0],
-                len(self.layers),
-                len(positions),
-                self.model.config.hidden_size,
-            ),
-            device=self.model.device,
-        )
-
-        for i in range(0, inputs.input_ids.shape[0], batch_size):
-            batch_inputs = {
-                k: v[i : min(i + batch_size, inputs.input_ids.shape[0])]
-                for k, v in inputs.items()
-            }
-            hidden_states = pruned_forward(
-                self.model.model,
-                self.layers,
-                input_ids=batch_inputs["input_ids"],
-                keep_conversion_layer=self.keep_conversion_layer,
-            )
-
-            for j in range(len(hidden_states)):
-                emb[i : min(i + batch_size, inputs.input_ids.shape[0]), j, :] = (
-                    hidden_states[j][:, :]
-                    if self.positions is None
-                    else hidden_states[j][:, self.positions, :]
-                )
-
-        if self.requires_grad_:
-            emb.requires_grad_()
-
-        if return_numpy:
-            emb = emb.cpu().detach().numpy()
-
-        if self.positions is None and lengths is not None and return_numpy and unpad:
-            emb = [emb[i, :, -lengths[i] :, :] for i in range(emb.shape[0])]
-
-        return emb
-
-
-class TruncatedEmbeddingLens(EmbeddingLens):
-    @type_check
-    def __call__(
-        batch_size,
-        self,
-        input: Union[str, List[str], torch.Tensor],
-        return_numpy: bool = False,
-        unpad: bool = False,
-    ) -> torch.Tensor:
-        """
-        Computes the context for the given input.
-
-        Args:
-            batch_size (int): The batch size for processing the input.
-            input (Union[str, List[str], torch.Tensor]): The input text or batch of texts.
-
-        Returns:
-            torch.Tensor: The computed contextual embeddings.
-
-        """
-        assert (
-            isinstance(input, str)
-            or isinstance(input, list)
-            or isinstance(input, torch.Tensor)
-        ), "Input must be a string, a list of strings, or a tensor"
-
-        if isinstance(input, torch.Tensor):
-            inputs = input
-            lengths = None
-        else:
-            input = [input] if isinstance(input, str) else input
-            inputs = self.tokenizer(input, return_tensors="pt", padding=True).to(
-                self.model.device
-            )
-            # Use attention mask to get the prompt length
-            lengths = torch.sum(inputs.attention_mask, dim=1).cpu().numpy()
-
-        positions = (
-            [i for i in range(inputs.input_ids.shape[1])]
-            if self.positions is None
-            else self.positions
-        )
-
-        emb = torch.zeros(
-            (
-                inputs.input_ids.shape[0],
-                len(self.layers),
-                len(positions),
-                self.model.config.hidden_size,
-            ),
-            device=self.model.device,
-        )
-
-        for i in range(0, inputs.input_ids.shape[0], batch_size):
-            batch_inputs = {
-                k: v[i : min(i + batch_size, inputs.input_ids.shape[0])]
-                for k, v in inputs.items()
-            }
-            hidden_states = truncated_forward(
-                self.model.model,
-                self.start_layer,
-                self.end_layer,
-                input_ids=batch_inputs["input_ids"],
-                keep_conversion_layer=self.keep_conversion_layer,
-            )
-
-            for j in range(len(hidden_states)):
-                emb[i : min(i + batch_size, inputs.input_ids.shape[0]), j, :] = (
-                    hidden_states[j][:, :]
-                    if self.positions is None
-                    else hidden_states[j][:, self.positions, :]
-                )
-
-            # Delete hidden_states to free up memory
-            del hidden_states
-            torch.cuda.empty_cache()
-
-        if self.requires_grad_:
-            emb.requires_grad_()
-
-        if return_numpy:
-            emb = emb.cpu().detach().numpy()
-
-        if self.positions is None and lengths is not None and return_numpy and unpad:
-            emb = [emb[i, :, -lengths[i] :, :] for i in range(emb.shape[0])]
-
-        return emb

@@ -5,7 +5,7 @@ from typing import List, Optional, Union
 
 import pandas as pd
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 from clfextract.prompt_managers import HFPromptManager, PromptManager
 from clfextract.utils import arange_args, filter_kwargs, type_check
@@ -72,10 +72,11 @@ class ExpConfig(Hyperparameters):
         model_path: str,
         *,
         dataset_path: Optional[str] = None,
-        output_path: Optional[str] = None,
+        output_dir: Optional[str] = None,
         model_device: Optional[str] = None,
-        tokenizer_kwargs: dict = {},
         model_kwargs: dict = {},
+        tokenizer_kwargs: dict = {},
+        num_layers: Optional[int] = None,
         start: Optional[int] = None,
         end: Optional[int] = None,
         judge_path: Optional[str] = None,
@@ -87,6 +88,7 @@ class ExpConfig(Hyperparameters):
     ):
         self.model_path = model_path
 
+        self.output_dir = "." if output_dir is None else output_dir
         self.dataset_path = "" if dataset_path is None else dataset_path
         self.tokenizer_path = model_path
 
@@ -106,11 +108,17 @@ class ExpConfig(Hyperparameters):
         if model_device != "auto":
             model_device = torch.device(model_device)
         if not no_model:
+            model_config = AutoConfig.from_pretrained(
+                self.model_path,
+            )
+            if num_layers is not None:
+                model_config.num_hidden_layers = num_layers
+
             self.model = AutoModelForCausalLM.from_pretrained(
                 self.model_path,
-                output_hidden_states=True,
                 torch_dtype=torch_dtype,
                 device_map=model_device,
+                config=model_config,
                 **model_kwargs,
             )
             if self.tokenizer.pad_token is None:
@@ -169,7 +177,7 @@ class ExpConfig(Hyperparameters):
                 self.start < self.end
             ), f"Invalid values for start and end. The start index must be less than the end index ({self.start} and {self.end} were provided)"
 
-        self.output_path = output_path
+        self.num_layers = num_layers
         self.half = half
         self.model_device = model_device
         self.judge_path = judge_path
@@ -225,7 +233,7 @@ def set_config() -> GeneralConfig:
         --half (bool): Use half precision.
         --start (int): Start index. Default is None.
         --end (int): End index. Default is None.
-        --output_path (str): Output path. Default is None.
+        --output_dir (str): Output path. Default is None.
         --offline (bool): Use offline evaluation.
         --model_device (str): Device for model. Default is None.
         --judge_path (str): Path to judge model. Default is None.
@@ -259,13 +267,20 @@ def set_config() -> GeneralConfig:
     )
     parser.add_argument("--half", action="store_true", help="Use half precision")
     parser.add_argument(
+        "--num_layers",
+        type=int,
+        required=False,
+        help="Number of layers to use in the model",
+        default=None,
+    )
+    parser.add_argument(
         "--start", type=int, required=False, help="Start index", default=None
     )
     parser.add_argument(
         "--end", type=int, required=False, help="End index", default=None
     )
     parser.add_argument(
-        "--output_path", type=str, required=False, help="Output path", default=None
+        "--output_dir", type=str, required=False, help="Output path", default=None
     )
     parser.add_argument(
         "--model_device",
@@ -302,7 +317,11 @@ def set_config() -> GeneralConfig:
 
     # Threat Model Config
     parser.add_argument(
-        "--append_strat", type=str, required=False, help="Append strategy", default=None
+        "--append_strat",
+        type=str,
+        required=False,
+        help="Append strategy",
+        default="suffix",
     )
     parser.add_argument(
         "--conv_template",

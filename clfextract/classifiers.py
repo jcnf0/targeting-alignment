@@ -6,7 +6,6 @@ import torch.nn as nn
 import torch.optim as optim
 from sklearn.metrics import f1_score, precision_recall_curve, roc_curve
 from sklearn.model_selection import StratifiedKFold
-from statsmodels.stats.contingency_tables import mcnemar
 from torch.utils.data import DataLoader, TensorDataset
 
 
@@ -36,7 +35,7 @@ class Classifier:
         model: nn.Module,
         learning_rate: float = 0.001,
         batch_size: int = 32,
-        criterion: Optional[nn.Module] = None,
+        criterion: Optional[nn.Module] = nn.BCELoss,
         device: Optional[str] = None,
         verbose: bool = True,
     ):
@@ -46,7 +45,7 @@ class Classifier:
             else torch.device(device)
         )
         self.model = model.to(self.device)
-        self.criterion = criterion or nn.BCELoss()
+        self.criterion = criterion
         self.optimizer = optim.Adam(self.model.parameters(), lr=learning_rate)
         self.batch_size = batch_size
         self.verbose = verbose
@@ -349,7 +348,6 @@ class RNNModel(nn.Module):
 def compare_classifiers(
     setting1: Union[Tuple[Classifier, torch.Tensor], torch.Tensor],
     setting2: Union[Tuple[Classifier, torch.Tensor], torch.Tensor],
-    method: str = "agreement",
     threshold: float = 0.5,
 ) -> Union[float, Tuple[float, float]]:
     """
@@ -357,12 +355,10 @@ def compare_classifiers(
 
     Args:
         setting1 (Union[Tuple[Classifier, torch.Tensor],torch.Tensor]): Can be y_pred or (clf, X)
-        method (str): The comparison method, either 'agreement' or 'mcnemar'. Defaults to 'agreement'.
 
     Returns:
         Union[float, Tuple[float, float]]:
             If method is 'agreement': The agreement rate between the two classifiers.
-            If method is 'mcnemar': The test statistic and p-value of McNemar's test.
 
     Raises:
         ValueError: If an invalid method is specified.
@@ -379,17 +375,5 @@ def compare_classifiers(
     else:
         y_pred2 = setting2.cpu().numpy().astype(int)
 
-    if method == "agreement":
-        agreement_rate = (y_pred1 == y_pred2).mean()
-        return agreement_rate
-    elif method == "mcnemar":
-        contingency_table = np.zeros((2, 2))
-        for i in range(4):
-            contingency_table[i // 2, i % 2] = np.sum(
-                (y_pred1 == (i // 2)) & (y_pred2 == (i % 2))
-            )
-        test = mcnemar(contingency_table, exact=False, correction=True)
-        return test.statistic, test.pvalue
-
-    else:
-        raise ValueError("Invalid method. Choose either 'agreement' or 'mcnemar'.")
+    agreement_rate = (y_pred1 == y_pred2).mean()
+    return agreement_rate

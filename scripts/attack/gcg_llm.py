@@ -1,4 +1,4 @@
-# Obtained from https://github.com/GraySwanAI/nanoGCG/blob/main/nanogcg/gcg.py
+# Modified from https://github.com/GraySwanAI/nanoGCG/blob/main/nanogcg/gcg.py
 import copy
 import gc
 import logging
@@ -7,15 +7,11 @@ from typing import List, Optional, Union
 
 import torch
 import transformers
+from gcgutils import (INIT_CHARS, find_executable_batch_size,
+                      get_nonascii_toks, mellowmax)
 from torch import Tensor
 from tqdm import tqdm
 from transformers import set_seed
-from gcgutils import (
-    INIT_CHARS,
-    find_executable_batch_size,
-    get_nonascii_toks,
-    mellowmax,
-)
 
 logger = logging.getLogger("nanogcg")
 if not logger.hasHandlers():

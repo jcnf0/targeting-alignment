@@ -8,11 +8,11 @@ mkdir -p $viz_dir
 # Run the visualization scripts
 python3 $scripts_dir/plot_metadatas.py -i $results_dir/metadatas.json -o $viz_dir/metadatas
 
-models_lists=("llama2 qwen2 gemma1 gemma2 granite")
+models_lists=("llama2 qwen2 gemma1 granite")
 # models_lists=("llama2 qwen2 gemma1 gemma2 granite" "llama3 mistral zephyrrmu") # Include other models
 
 for list_models in "${models_lists[@]}"; do
-    if [[ $list_models == "llama2 qwen2 gemma1 gemma2 granite" ]]; then
+    if [[ $list_models == "llama2 qwen2 gemma1 granite" ]]; then
         viz_dir=/workspace/figures/main_models
     else
         viz_dir=/workspace/figures/other_models
@@ -37,4 +37,3 @@ for list_models in "${models_lists[@]}"; do
     done
 
 done
-

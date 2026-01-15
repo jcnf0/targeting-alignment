@@ -7,19 +7,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
-
-from clfextract.utils import (
-    savefig,
-    MODELS,
-    MODELS_MAP,
-    REVERSE_MODELS_MAP,
-    LAYER_MAP,
-    DATASET_LINESTYLES,
-    DATASET_MAP,
-    MARKER_MAP,
-)
 from matplotlib.lines import Line2D
 
+from clfextract.utils import (DATASET_LINESTYLES, DATASET_MAP, LAYER_MAP,
+                              MARKER_MAP, MODELS, MODELS_MAP,
+                              REVERSE_MODELS_MAP, savefig)
 
 palette = sns.color_palette("tab10", len(MODELS_MAP.values()))
 model_palette = {model: palette[i] for i, model in enumerate(MODELS_MAP.values())}

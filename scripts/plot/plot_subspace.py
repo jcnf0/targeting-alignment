@@ -2,96 +2,139 @@ import argparse
 import glob
 import json
 import os
-from collections import defaultdict
 
 import matplotlib.pyplot as plt
-from matplotlib.lines import Line2D
 import numpy as np
+import pandas as pd
 import seaborn as sns
-from tqdm import tqdm
+from matplotlib.lines import Line2D
 
-from clfextract.utils import (
-    savefig,
-    MODELS,
-    MODELS_MAP,
-    LAYER_MAP,
-    MARKER_MAP,
-    SOURCE_MAP,
-)
+from clfextract.utils import (DATASET_LINESTYLES, DATASET_MAP, LAYER_MAP,
+                              MARKER_MAP, MODELS, MODELS_MAP,
+                              REVERSE_MODELS_MAP, savefig)
 
-
+palette = sns.color_palette("tab10", len(MODELS_MAP.values()))
+model_palette = {model: palette[i] for i, model in enumerate(MODELS_MAP.values())}
 sns.set_style("whitegrid")
 
 
-def create_silhouette_lineplot(results_by_model, score_type, output_dir):
-    """
-    Create a lineplot showing silhouette scores across models and sources.
-    score_type: either 'silhouette_y' or 'silhouette_y_pred'
-    """
-    model_source_data = defaultdict(lambda: defaultdict(list))
-    unique_models = set()
+def get_args():
+    parser = argparse.ArgumentParser(description="Visualize transfer learning results")
+    parser.add_argument(
+        "--input",
+        "-i",
+        type=str,
+        required=True,
+        help="Path to the JSON file containing the transfer results",
+    )
+    parser.add_argument(
+        "--output",
+        "-o",
+        type=str,
+        default="results",
+        help="Directory to save output plots and statistics",
+    )
+    parser.add_argument(
+        "--models",
+        "-m",
+        nargs="+",
+        default=["llama2", "qwen2", "gemma1", "gemma2"],
+        help="Models to include in the visualization",
+    )
+    parser.add_argument(
+        "--dataset_name",
+        "-d",
+        type=str,
+        default="",
+        help="Name of the dataset",
+    )
+    parser.add_argument(
+        "--datasets",
+        "-ds",
+        nargs="+",
+        default=["advbench_harmful.json", "or-bench_harmful.json"],
+        help="Datasets to include in the visualization",
+    )
 
-    for model, results in results_by_model.items():
-        if model not in MODELS:
+    return parser.parse_args()
+
+
+def load_json_data(json_file, subset=""):
+    all_records = []
+
+    with open(json_file, "r") as f:
+        all_data = json.load(f)  # List of dictionaries
+
+    for data in all_data:
+        metadata = data["metadata"]
+        if subset not in metadata["dataset"]:
             continue
-        unique_models.add(model)
-        for result in results:
-            source = result["source"]
-            layer = result["layer"]
-            score = result[score_type]
-            model_source_data[model][source].append((layer, score))
+        clf_layer = metadata["clf"]["layer"]
+        clf_best_threshold = metadata["clf"]["best_threshold"]
 
-    colors = sns.color_palette("tab10", len(MODELS))
-    color_map = {model: color for model, color in zip(MODELS, colors)}
-    linestyles = ["solid", "dotted"]
+        for record in data["records"]:
+            for step, loss in enumerate(record.get("losses", [])):
+                record_with_metadata = {
+                    **record,
+                    "best_threshold": clf_best_threshold,
+                    "model": (
+                        metadata["model"]
+                        if "granite" not in metadata["model"]
+                        else "granite"
+                    ),
+                    "dataset": metadata["dataset"],
+                    "attack": metadata["attack"],
+                    "layer": clf_layer,
+                    "step": step,
+                    "step_loss": loss,
+                    "y_clf": record["y_clf"],
+                }
+                all_records.append(record_with_metadata)
+
+    return pd.DataFrame(all_records)
+
+
+def visualize_results(df, output_dir="results", dataset_name=""):
+    os.makedirs(output_dir, exist_ok=True)
 
     plt.figure()
-    # To track added legend entries
+    success_by_layer = (
+        df.groupby(["layer", "model", "dataset"])["llm_success"].mean().reset_index()
+    )
+
+    # colors = sns.color_palette("tab10", len(MODELS))
+    # color_map = {model: color for model, color in zip(MODELS, colors)}
     added_model_legend = set()
     added_source_legend = set()
+    # Create the success rate plot with seaborn lineplot
+    for dataset in success_by_layer["dataset"].unique():
+        for model in success_by_layer["model"].unique():
+            model_data = success_by_layer[success_by_layer["model"] == model]
+            model_data = model_data[model_data["dataset"] == dataset]
+            fraction = model_data["layer"] / LAYER_MAP[REVERSE_MODELS_MAP[model]]
+            plt.plot(
+                fraction,
+                model_data["llm_success"],
+                label=model,
+                marker=MARKER_MAP[REVERSE_MODELS_MAP[model]],
+                color=model_palette[model],
+                linestyle=DATASET_LINESTYLES[dataset],
+                linewidth=2,
+                markersize=4,
+            )
 
-    for source in SOURCE_MAP.keys():
-        for model, sources in model_source_data.items():
-            if source in sources:
-                values = sources[source]
-                values.sort(key=lambda x: x[0])  # Sort by layer
-                layers, scores = zip(*values)
-                fractions = [layer / LAYER_MAP[model] for layer in layers]
+            added_model_legend.add(model)
+            added_source_legend.add(dataset)
 
-                # Plotting the line
-                plt.plot(
-                    fractions,
-                    scores,
-                    linestyle=linestyles[
-                        list(SOURCE_MAP.keys()).index(source) % len(linestyles)
-                    ],
-                    color=color_map[model],
-                    marker=MARKER_MAP[model],
-                    label=(
-                        MODELS_MAP[model] if model not in added_model_legend else None
-                    ),  # Add model legend once
-                    linewidth=1,
-                    markersize=2,
-                )
-                # Add the model to the set
-                added_model_legend.add(model)
-
-                # Handle source legend (linestyle)
-                if source not in added_source_legend:
-                    added_source_legend.add(SOURCE_MAP[source])
-
-    # Create custom legend entries for sources
-    source_legend = [
+    dataset_legend = [
         Line2D(
             [0],
             [0],
-            linestyle=linestyles[
-                list(SOURCE_MAP.keys()).index(source) % len(linestyles)
-            ],
             color="black",
-            label=SOURCE_MAP[source],
+            linestyle=DATASET_LINESTYLES[dataset],
+            label=dataset,
         )
-        for source in SOURCE_MAP.keys()
+        for dataset in success_by_layer["dataset"].unique()
     ]
 
     # Add legends for models (color) and sources (linestyles)
@@ -100,172 +143,122 @@ def create_silhouette_lineplot(results_by_model, score_type, output_dir):
             Line2D(
                 [0],
                 [0],
-                color=color_map[model],
-                label=MODELS_MAP[model],
-                marker=MARKER_MAP[model],
+                color=model_palette[model],
+                label=model,
+                marker=MARKER_MAP[REVERSE_MODELS_MAP[model]],
             )
             for model in sorted(added_model_legend)
         ]
-        + source_legend,
+        + dataset_legend,
         loc="upper left",
     )
-
     plt.xlim(0, 1.05)
-    plt.ylim(0, 0.6)
-    plt.xlabel("Normalized Decoder Position")
-    plt.ylabel("Silhouette Score")
+    plt.ylim(0, 1.05)
+    plt.xlabel("Normalized Candidate Size")
+    plt.ylabel("Transferability Rate")
 
-    # savefig(os.path.join(output_dir, f"{score_type}_lineplot_{source}.pdf"))
-    savefig(os.path.join(output_dir, f"{score_type}_lineplot.pdf"))
+    savefig(os.path.join(output_dir, f"transfer_clf_llm_{dataset_name}.pdf"))
 
 
-def create_component_heatmap_by_source(
-    results, model, score_type, source, n_components, output_dir
-):
+def compute_and_plot_asr(df, output_dir="results", dataset_name=""):
     """
-    Create a heatmap of silhouette scores for PCA components for a specific source.
+    Compute and plot Attack Success Rate (ASR) for each layer and model
 
     Args:
-        results: List of results for a specific model
-        model: Model name
-        score_type: Either 'silhouette_y_pca' or 'silhouette_y_pred_pca'
-        source: Specific source to plot
-        n_components: Number of PCA components to show
-        output_dir: Directory to save the plot
+        df (pd.DataFrame): Input dataframe with model results
+        output_dir (str): Directory to save output plots
     """
-    # Filter results for the specific source
-    source_results = [r for r in results if r["source"] == source]
-
-    if not source_results:
-        return
-
-    # Get all unique layers
-    layers = sorted(list(set(r["layer"] for r in source_results)))
-
-    # Create matrix for heatmap
-    heatmap_data = np.zeros((n_components, len(layers)))
-
-    # Fill the matrix
-    for layer_idx, layer in enumerate(layers):
-        layer_results = [r for r in source_results if r["layer"] == layer]
-        if layer_results:
-            avg_scores = np.mean(
-                [r["pca"][score_type][:n_components] for r in layer_results], axis=0
-            )
-            heatmap_data[:, layer_idx] = avg_scores
+    # Group by model, layer, and take the last step's clf_success
+    asr_by_layer = (
+        df.groupby(["model", "layer", "dataset"])["clf_success"].mean().reset_index()
+    )
 
     plt.figure()
-    sns.heatmap(
-        heatmap_data,
-        cmap="coolwarm",
-        xticklabels=range(0, len(layers), 5),
-        yticklabels=range(n_components),
-        vmin=-1,
-        vmax=1,
-        cbar_kws={"label": "Silhouette Score"},
+    added_model_legend = set()
+    added_source_legend = set()
+    # Create the ASR plot with plt.plot
+    for dataset in asr_by_layer["dataset"].unique():
+        for model in asr_by_layer["model"].unique():
+            model_data = asr_by_layer[
+                (asr_by_layer["model"] == model) & (asr_by_layer["dataset"] == dataset)
+            ]
+            model_data = model_data[model_data["dataset"] == dataset]
+            model_data["fraction"] = (
+                model_data["layer"] / LAYER_MAP[REVERSE_MODELS_MAP[model]]
+            )
+            plt.plot(
+                model_data["fraction"],
+                model_data["clf_success"],
+                label=model,
+                marker=MARKER_MAP[REVERSE_MODELS_MAP[model]],
+                color=model_palette[model],
+                linestyle=DATASET_LINESTYLES[dataset],
+                linewidth=2,
+                markersize=4,
+            )
+
+            added_model_legend.add(model)
+            added_source_legend.add(dataset)
+
+    dataset_legend = [
+        Line2D(
+            [0],
+            [0],
+            color="black",
+            linestyle=DATASET_LINESTYLES[dataset],
+            label=dataset,
+        )
+        for dataset in asr_by_layer["dataset"].unique()
+    ]
+
+    plt.legend(
+        handles=[
+            Line2D(
+                [0],
+                [0],
+                color=model_palette[model],
+                label=model,
+                marker=MARKER_MAP[REVERSE_MODELS_MAP[model]],
+            )
+            for model in sorted(asr_by_layer["model"].unique())
+        ]
+        + dataset_legend,
+        loc="lower left",
     )
-    plt.xticks(
-        ticks=range(0, len(layers), 5), labels=range(0, len(layers), 5), rotation=0
+    plt.xlabel("Normalized Candidate Size")
+    plt.ylabel("Classifier ASR")
+    plt.xlim(0, 1.05)  # Set x-axis from 0 to 1
+    plt.ylim(0, 1.05)  # Set y-axis from 0 to 1
+
+    savefig(os.path.join(output_dir, f"classifier_asr_{dataset_name}.pdf"))
+
+    # Optional: Save ASR data to CSV for further analysis
+    asr_by_layer.to_csv(
+        os.path.join(output_dir, f"classifier_asr_{dataset_name}.csv"),
+        index=False,
     )
-    plt.yticks(
-        ticks=np.arange(0.5, n_components + 0.5),
-        labels=range(1, n_components + 1),
-        rotation=0,
-    )
-    plt.xlabel("Decoder")
-    # Make ticks every 5 layers
-    plt.ylabel("PCA Component")
 
-    savefig(os.path.join(output_dir, f"{model}_{source}_{score_type}_heatmap.pdf"))
-
-
-def process_results(results, output_dir, n_components=20):
-    # Group results by model
-    results_by_model = defaultdict(list)
-    for result in results:
-        model = result["model"]
-        results_by_model[model].append(result)
-
-    # Get unique sources
-    sources = set(result["source"] for result in results)
-
-    # Create output directories
-    os.makedirs(output_dir, exist_ok=True)
-    os.makedirs(os.path.join(output_dir, "component_heatmaps"), exist_ok=True)
-
-    # Create source-specific directories
-
-    # Create general silhouette lineplots for each source
-    for score_type in ["silhouette_y", "silhouette_y_pred"]:
-        print(f"Creating silhouette lineplot for score type: {score_type}")
-        create_silhouette_lineplot(results_by_model, score_type, output_dir)
-
-    # # Create component heatmaps for each model and source
-    # for model, model_results in tqdm(results_by_model.items()):
-    #     if model not in MODELS:
-    #         continue
-    #     print(f"Creating component heatmaps for model: {model}")
-    #     for source in sources:
-    #         for score_type in ["silhouette_y_pca", "silhouette_y_pred_pca"]:
-    #             create_component_heatmap_by_source(
-    #                 model_results,
-    #                 model,
-    #                 score_type,
-    #                 source,
-    #                 n_components,
-    #                 os.path.join(output_dir, "component_heatmaps"),
-    #             )
-
-    # print("Finished processing all results")
+    return asr_by_layer
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Generate visualizations for silhouette analysis results."
-    )
-    parser.add_argument(
-        "--input",
-        "-i",
-        type=str,
-        nargs="+",
-        default=["results.json"],
-        help="Paths to the input JSON files containing all results (supports pattern matching)",
-    )
-    parser.add_argument(
-        "--output",
-        "-o",
-        type=str,
-        default="silhouette_visualizations",
-        help="Base directory for output visualizations",
-    )
-    parser.add_argument(
-        "--n_components",
-        type=int,
-        default=5,
-        help="Number of PCA components to analyze in heatmaps",
-    )
-    parser.add_argument(
-        "--models",
-        "-m",
-        type=str,
-        nargs="+",
-        default=["llama2", "qwen2", "gemma1", "gemma2"],
-        help="Models to include in the visualizations",
-    )
-    args = parser.parse_args()
+    args = get_args()
 
-    # Properly offset the model list for the color scheme
     for i in range(len(MODELS)):
         if MODELS[i] not in args.models:
             MODELS[i] = None
 
-    all_results = []
-    for pattern in args.input:
-        for file_path in glob.glob(pattern):
-            with open(file_path, "r") as f:
-                all_results.extend(json.load(f))
+    print(f"Loading data from {args.input}...")
 
-    # Process all results
-    process_results(all_results, args.output, args.n_components)
+    df = load_json_data(args.input, subset=args.dataset_name)
 
-    print("All visualizations have been generated.")
+    print("Data loaded.")
+
+    df = df[df["model"].isin(MODELS)]
+    df["model"] = df["model"].map(MODELS_MAP)
+    df["dataset"] = df["dataset"].map(DATASET_MAP)
+
+    visualize_results(df, args.output, dataset_name=args.dataset_name)
+
+    # Compute and plot ASR
+    asr_by_layer = compute_and_plot_asr(df, args.output, dataset_name=args.dataset_name)

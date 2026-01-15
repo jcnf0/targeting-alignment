@@ -6,13 +6,11 @@ import numpy as np
 import polars as pl
 import torch
 import torch.multiprocessing as mp
-from clfextract.classifiers import (
-    LinearClassifier,
-    RNNClassifier,
-    MLPClassifier
-)
-from clfextract.datasets import ParquetManager
 from sklearn.model_selection import StratifiedKFold
+
+from clfextract.classifiers import (LinearClassifier, MLPClassifier,
+                                    RNNClassifier)
+from clfextract.datasets import ParquetManager
 
 
 def get_args():
@@ -32,7 +30,7 @@ def get_args():
     parser.add_argument(
         "--attacks",
         type=str,
-        required=True,
+        default="benign+gcg",
         help="Attacks to analyze (comma-separated)",
     )
     parser.add_argument(
@@ -47,7 +45,7 @@ def get_args():
     parser.add_argument(
         "--train",
         type=str,
-        default="y_true",
+        default="y_pred",
         choices=["y_true", "y_pred"],
         help="Labels to train on",
     )
@@ -73,21 +71,21 @@ def get_args():
         "--early_stopping", action="store_true", help="Whether to use early stopping"
     )
     parser.add_argument(
-        "--patience", type=int, default=5, help="Patience for early stopping"
+        "--patience", type=int, default=15, help="Patience for early stopping"
     )
     parser.add_argument(
-        "--n_splits", type=int, default=1, help="Number of splits for cross-validation"
+        "--n_splits", type=int, default=5, help="Number of splits for cross-validation"
     )
     parser.add_argument(
-        "--num_epochs", type=int, default=100, help="Number of epochs to train"
+        "--num_epochs", type=int, default=500, help="Number of epochs to train"
     )
     parser.add_argument("--source", type=str, default="", help="Source dataset")
-    parser.add_argument(
-        "--sequential", action="store_true", help="Whether to run sequentially"
-    )
+    parser.add_argument("--parallel", action="store_true")
     parser.add_argument(
         "--cross_source", type=str, default="", help="Cross-source dataset"
     )
+    parser.add_argument("--device", type=str, default="cuda", help="Device name")
+    parser.add_argument("--n_trials", type=int, default=1, help="Number of trials")
     return parser.parse_args()
 
 
@@ -248,8 +246,9 @@ def load_all_data(
     source="",
     cross_source="",
     data_dir="",
+    device="cuda",
 ):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(device)
     data_cache = {}
 
     base_filters = {"layer": {"in": list(range(start_layer, end_layer + 1))}}
@@ -265,11 +264,7 @@ def load_all_data(
     print("Loading all data from Parquet files...")
     data_files = os.listdir(data_dir)
     data_files = [f for f in data_files if f.endswith(".parquet")]
-    files = [
-        f
-        for f in data_files
-        if model in f and source in f
-    ]
+    files = [f for f in data_files if model in f and source in f]
     if len(files) == 0:
         raise ValueError("No files found to load.")
 
@@ -614,30 +609,42 @@ if __name__ == "__main__":
         attacks=args.attacks.split("+"),
         source=args.source,
         cross_source=args.cross_source,
+        data_dir=args.input,
+        device=args.device,
     )
 
     print("Data loaded.")
 
-    if args.sequential:
-        layer_results = [
-            process_layer(args, layer, data_cache)
-            for layer in range(args.start_layer, args.end_layer + 1)
-        ]
-    else:
-        # Process layers in parallel
-        with mp.Pool(processes=args.end_layer - args.start_layer + 1) as pool:
-            layer_results = pool.starmap(
-                process_layer,
-                [
-                    (args, layer, data_cache)
-                    for layer in range(args.start_layer, args.end_layer + 1)
-                ],
-            )
+    trial_results = []
 
-    combined_results = layer_results
-    output_filename = (os.path.join(args.output_dir, f"clf_analysis_{args.model}_{args.source}_{args.classifier_type}_layer{args.start_layer:02d}-{args.end_layer:02d}_{args.train}_{args.attacks}.json"))
+    for i in range(args.n_trials):
+        if args.parallel:
+            # Process layers in parallel
+            with mp.Pool(processes=args.end_layer - args.start_layer + 1) as pool:
+                layer_results = pool.starmap(
+                    process_layer,
+                    [
+                        (args, layer, data_cache)
+                        for layer in range(args.start_layer, args.end_layer + 1)
+                    ],
+                )
+        else:
+            layer_results = [
+                process_layer(args, layer, data_cache)
+                for layer in range(args.start_layer, args.end_layer + 1)
+            ]
+
+        trial_results.extend(layer_results)
+
+    output_filename = os.path.join(
+        args.output,
+        f"clf_analysis_{args.model}_{args.source}_{args.classifier_type}_layer{args.start_layer:02d}-{args.end_layer:02d}_{args.train}_{args.attacks}_{args.n_trials}trials.json",
+    )
+
+    if not os.path.exists(args.output):
+        os.makedirs(args.output)
 
     with open(output_filename, "w") as f:
-        json.dump(combined_results, f, indent=2)
+        json.dump(trial_results, f, indent=2)
 
     print(f"Results saved to {output_filename}")

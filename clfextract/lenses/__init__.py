@@ -1,4 +1,4 @@
-from .embeddings import EmbeddingLens, KVLens, TruncatedEmbeddingLens
+from .embeddings import EmbeddingLens, KVLens
 from .lenses import Lens
 
 

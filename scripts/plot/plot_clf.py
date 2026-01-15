@@ -1,19 +1,14 @@
 import argparse
 import json
 import os
-import numpy as np
+
 import matplotlib.pyplot as plt
+import numpy as np
 import seaborn as sns
 from tqdm import tqdm
 
-from clfextract.utils import (
-    savefig,
-    MODELS,
-    MODELS_MAP,
-    MARKER_MAP,
-    LAYER_MAP,
-    METRIC_MAP,
-)
+from clfextract.utils import (LAYER_MAP, MARKER_MAP, METRIC_MAP, MODELS,
+                              MODELS_MAP, savefig)
 
 sns.set_style("whitegrid")
 colors = sns.color_palette("tab10", len(MODELS))
@@ -21,10 +16,10 @@ color_map = {model: color for model, color in zip(MODELS, colors)}
 
 
 def create_lineplot(
-    data_by_model, metric_name, output_file, y_label, y_min=0.5, y_max=1.0
+    data_by_model, metric_name, output_file, y_label, y_min=0.5, y_max=1.05
 ):
     """
-    Generic function for creating lineplots for any metric
+    Generic function for creating lineplots for any metric with confidence intervals
 
     Parameters:
     - data_by_model: Dictionary mapping models to lists of (layer, value) tuples
@@ -44,21 +39,62 @@ def create_lineplot(
         layers, test_values = zip(*values)
         fractions = [layer / LAYER_MAP[model] for layer in layers]
 
+        # Group values by layer for confidence interval calculation
+        layer_groups = {}
+        for layer, value in values:
+            if layer not in layer_groups:
+                layer_groups[layer] = []
+            layer_groups[layer].append(value)
+
+        medians = []
+        lower_bounds = []
+        upper_bounds = []
+        for layer in sorted(layer_groups.keys()):
+            group_values = layer_groups[layer]
+            median = np.median(group_values)
+            # Calculate confidence interval for the median using bootstrapping
+            bootstrapped_medians = [
+                np.median(
+                    np.random.choice(group_values, size=len(group_values), replace=True)
+                )
+                for _ in range(1000)
+            ]
+            lower_bound = np.percentile(bootstrapped_medians, 2.5)  # 2.5th percentile
+            upper_bound = np.percentile(bootstrapped_medians, 97.5)  # 97.5th percentile
+
+            medians.append(median)
+            lower_bounds.append(lower_bound)
+            upper_bounds.append(upper_bound)
+
+        fractions = [layer / LAYER_MAP[model] for layer in sorted(layer_groups.keys())]
         # Filter out points at x=0 if needed
         if metric_name.startswith("attack"):
-            fractions, test_values = zip(
-                *[(f, t) for f, t in zip(fractions, test_values) if f != 0]
-            )
+            filtered = [
+                (fraction, median, lower_bound, upper_bound)
+                for fraction, median, lower_bound, upper_bound in zip(
+                    fractions, medians, lower_bounds, upper_bounds
+                )
+                if fraction != 0
+            ]
+            fractions, medians, lower_bounds, upper_bounds = zip(*filtered)
 
         plt.plot(
             fractions,
-            test_values,
+            medians,
             linestyle="solid",
             color=color_map[model],
             marker=MARKER_MAP[model],
             label=MODELS_MAP[model],
             markersize=4,
             linewidth=1,
+        )
+
+        plt.fill_between(
+            fractions,
+            lower_bounds,
+            upper_bounds,
+            color=color_map[model],
+            alpha=0.2,
         )
 
     plt.xlabel("Normalized Candidate Size")
@@ -103,29 +139,29 @@ def extract_metric_data(results, metric, data_type="test"):
 
         if "cross_source" in result["layer_classifier"] and data_type == "cross_source":
             cross_source = result["layer_classifier"]["cross_source"]
-            if cross_source["source"] == source:
+            if True:
                 fold_results = [
                     cross_source["fold_results"][i][metric]
                     for i in range(len(cross_source["fold_results"]))
                 ]
-                value = np.mean(fold_results)
-            else:
-                continue
+                for fold_value in fold_results:
+                    model_source_data[model][source].append((layer, fold_value))
         elif "attacks" in result["layer_classifier"] and data_type == "attack":
             if len(result["attacks"]) <= 1:
                 continue
             attack_data = result["layer_classifier"]["attacks"]["gcg"]
+
             fold_results = [
                 attack_data["fold_results"][i]["transfer"]["harmful"][metric]
                 for i in range(len(attack_data["fold_results"]))
             ]
-            value = np.mean(fold_results)
+            for fold_value in fold_results:
+                model_source_data[model][source].append((layer, fold_value))
         else:
             # Standard metric in train/test data
-            values = np.mean(result["layer_classifier"][data_type][metric], axis=0)
-            value = values  # This is already the mean value
-
-        model_source_data[model][source].append((layer, value))
+            values = result["layer_classifier"][data_type][metric]
+            for fold_value in values:
+                model_source_data[model][source].append((layer, fold_value))
 
     return model_source_data
 
@@ -201,7 +237,7 @@ def process_results(results, output_base_dir):
             output_file,
             "Transferability Rate",
             y_min=0,
-            y_max=1,
+            y_max=1.05,
         )
 
 
@@ -228,7 +264,7 @@ if __name__ == "__main__":
         "-m",
         type=str,
         nargs="+",
-        default=["llama2", "qwen2", "gemma1", "gemma2"],
+        default=["llama2", "qwen2", "gemma1", "granite"],
         help="Models to include in the visualizations",
     )
     args = parser.parse_args()
@@ -243,5 +279,3 @@ if __name__ == "__main__":
 
     # Process all results
     process_results(all_results, args.output)
-
-    print("All visualizations have been generated.")

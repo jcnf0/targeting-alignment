@@ -4,7 +4,8 @@ import pandas as pd
 from tqdm import tqdm
 from transformers.pipelines import Pipeline
 
-from clfextract.utils import arange_args, find_executable_batch_size, type_check
+from clfextract.utils import (arange_args, find_executable_batch_size,
+                              type_check)
 
 START_BATCH_SIZE = 32
 
@@ -77,6 +78,7 @@ class Evaluator:
             "top_p": None,
             "do_sample": False,
             "max_new_tokens": 100,
+            "top_k": None,
         }  # For deterministic behavior
 
         self.gen_kwargs = self.gen_kwargs | gen_kwargs  # Update the provided gen_kwargs

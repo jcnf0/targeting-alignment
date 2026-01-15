@@ -1,45 +1,28 @@
 import json
 import os
+import time
 
 import numpy as np
 import polars as pl
 import torch
 import torch.nn as nn
+from gcg_clf import GCGConfig, run_gcg
+from sklearn.model_selection import train_test_split
+
 from clfextract.classifiers import Classifier
 from clfextract.configs import set_config
 from clfextract.datasets import ParquetManager
-from clfextract.evaluators import (
-    EnsembleEvaluator,
-    ModelEvaluator,
-    PipelineEvaluator,
-    StringMatchEvaluator,
-)
-from clfextract.lenses.embeddings import EmbeddingLens, truncated_forward
-from gcg_clf import GCGConfig, run_gcg
-from huggingface_hub import login
-from sklearn.model_selection import train_test_split
-from tqdm import tqdm
-from transformers import AutoModelForSequenceClassification, AutoTokenizer, pipeline
+from clfextract.lenses.embeddings import EmbeddingLens
+from clfextract.utils import VRAMMonitor, get_model_tag
 
 
-def map_y_pred(y_pred):
-    if not isinstance(y_pred, str):
-        return None
-    if y_pred.lower() == "normal":
-        return False
-    elif y_pred.lower() == "rejection":
-        return True
-    else:
-        return None
-
-
-class LinearClassifier(Classifier):
+class LinearClassifierNoSigmoid(Classifier):
     def __init__(self, input_dim: int, **kwargs):
-        model = nn.Sequential(nn.Linear(input_dim, 1), nn.Sigmoid())
-        super().__init__(model, **kwargs)
+        model = nn.Linear(input_dim, 1)
+        super().__init__(model, criterion=nn.BCEWithLogitsLoss(), **kwargs)
 
 
-class SubClassifier:
+class SurrogateClassifier:
     def __init__(self, model, head, lens):
         self.model = model
         self.head = head.model
@@ -50,8 +33,9 @@ class SubClassifier:
     def get_input_embeddings(self):
         return self.model.get_input_embeddings()
 
+    # This gets the logits without Sigmoid, as we use BCEWithLogitsLoss in GCG and during training
     def __call__(self, **kwargs):
-        embeds = self.lens(**kwargs).squeeze(1, 2, 3).float()
+        embeds = self.lens(**kwargs)[:, -1, -1, :].float()
         return self.head(embeds)
 
 
@@ -121,30 +105,11 @@ if __name__ == "__main__":
     tokenizer, model = config.exp.tokenizer, config.exp.model
 
     num_layers = model.config.num_hidden_layers
+    layer = int(config.exp.num_layers)
 
-    start_layer = 0
     end_layer = num_layers - 1
 
-    if "llama-2" in config.exp.model_path.lower():
-        model_tag = "llama2"
-    elif "llama-3" in config.exp.model_path.lower():
-        model_tag = "llama3"
-    elif "gemma-2" in config.exp.model_path.lower():
-        model_tag = "gemma2"
-    elif "gemma-7b" in config.exp.model_path.lower():
-        model_tag = "gemma1"
-    elif "qwen2" in config.exp.model_path.lower():
-        model_tag = "qwen2"
-    elif "mistral" in config.exp.model_path.lower():
-        model_tag = "mistral"
-    elif "zephyr_rmu" in config.exp.model_path.lower():
-        model_tag = "zephyrrmu"
-    elif "granite" in config.exp.model_path.lower():
-        model_tag = "granite"
-    else:
-        model_tag = config.exp.model_path.lower().split("/")[-1]
-
-    layer = int(config.misc.current_layer)
+    model_tag = get_model_tag(config.exp.model_path)
 
     mn = ParquetManager()
 
@@ -157,7 +122,9 @@ if __name__ == "__main__":
         source="advbench",
     )
 
-    classifier = LinearClassifier(x.shape[-1], learning_rate=1e-3, device=model.device)
+    classifier = LinearClassifierNoSigmoid(
+        x.shape[-1], learning_rate=1e-3, device=model.device
+    )
     (
         x_train,
         x_test,
@@ -170,9 +137,6 @@ if __name__ == "__main__":
     ) = train_test_split(
         x, y, y_pred, bases, test_size=0.2
     )  # Can use random state
-
-    print("Base Train: ", bases_train)
-    print("Base Test: ", bases_test)
 
     print("Training classifier...")
     num_epochs = 500
@@ -191,7 +155,6 @@ if __name__ == "__main__":
     print("Pred Accuracy Train :", train_acc, "F1 Score Train :", train_f1)
     print("Pred Accuracy Test :", test_acc, "F1 Score Test :", test_f1)
 
-    # Find the best threshold
     precision, recall, thresholds = classifier.precision_recall_curve(
         x_train, y_pred_train
     )
@@ -199,13 +162,12 @@ if __name__ == "__main__":
     f_score = 2 * (precision * recall) / (precision + recall)
 
     best_threshold = thresholds[np.argmax(f_score)]
+    best_threshold = torch.sigmoid(torch.tensor(best_threshold)).item()
     print("Best Threshold: ", best_threshold)
 
-    lens = EmbeddingLens(
-        model, tokenizer, layers=[layer], positions=[-1], requires_grad_=True
-    )
+    lens = EmbeddingLens(model, tokenizer, requires_grad_=True)
 
-    subclassifier = SubClassifier(model.model, classifier, lens)
+    surrogate_classifier = SurrogateClassifier(model.model, classifier, lens)
 
     dataset = config.exp.dataset
     results = []
@@ -230,6 +192,7 @@ if __name__ == "__main__":
         },
         "clf": {
             "type": classifier.__class__.__name__,
+            "layer": layer,
             "train_acc": train_acc,
             "test_acc": test_acc,
             "train_f1": train_f1,
@@ -244,36 +207,16 @@ if __name__ == "__main__":
     else:
         target = 0 if "harmful" in config.exp.dataset_path else 1
 
-    clf_tokenizer = AutoTokenizer.from_pretrained(
-        "ProtectAI/distilroberta-base-rejection-v1"
-    )
-    clf_model = AutoModelForSequenceClassification.from_pretrained(
-        "ProtectAI/distilroberta-base-rejection-v1"
-    )
-
-    clf_pipeline = pipeline(
-        "text-classification",
-        model=clf_model,
-        tokenizer=clf_tokenizer,
-        truncation=True,
-        max_length=512,
-        device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
-    )
-
-    clf_evaluator = PipelineEvaluator(
-        config.exp.model,
-        config.exp.tokenizer,
-        config.prompt_manager,
-        clf_pipeline,
-    )
-
     records = []
 
     # Filter the dataset so that it matches the test bases
     dataset = dataset[dataset["base"].isin(bases_test)].reset_index(drop=True)
-    print("Filtered dataset: ", dataset)
 
-    # for i in tqdm(range(config.exp.start, config.exp.end)):
+    device_id = os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0]
+    device_id = int(device_id) if device_id.isdigit() else 0
+    # Initialize VRAM monitor
+    vram_monitor = VRAMMonitor(device_id=device_id, interval=0.1)
+
     for i in range(len(dataset)):
         if i == 1:
             break
@@ -281,7 +224,20 @@ if __name__ == "__main__":
         print(f"Running {i}/{len(dataset['base'])} : {base}")
         messages = [{"role": "user", "content": base}]
         gcg_config.target_class = target
-        result = run_gcg(subclassifier, tokenizer, messages, gcg_config)
+
+        # Start measurements
+        vram_monitor.start()
+        start_time = time.time()
+        result = run_gcg(surrogate_classifier, tokenizer, messages, gcg_config)
+        # Stop measurements
+        elapsed_time = time.time() - start_time
+        vram_monitor.stop()
+
+        vram_stats = vram_monitor.get_vram_stats()
+        print(f"Time taken for run_gcg: {elapsed_time:.2f} seconds")
+        print(
+            f"VRAM Usage during run_gcg (MB): Low={vram_stats['low']:.2f}, High={vram_stats['high']:.2f}"
+        )
 
         best_string, best_loss = result.best_string, result.best_loss
         strings, losses = result.strings, result.losses
@@ -295,11 +251,8 @@ if __name__ == "__main__":
         prompt = config.prompt_manager.get_prompt("")
 
         input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(model.device)
-        confidence_pre = subclassifier(input_ids=input_ids)
-        y_clf_base = float(confidence_pre.detach().cpu().numpy()[0][0])
-        y_llm_base = map_y_pred(
-            clf_evaluator([{"base": base, "attack": "", "append_strat": "suffix"}])[0]
-        )
+        confidence_pre = surrogate_classifier(input_ids=input_ids)
+        y_clf_base = torch.sigmoid(confidence_pre).item()
 
         # Every 50 steps until the num_steps
         eval_steps = list(range(50, gcg_config.num_steps + 1, 50))
@@ -312,45 +265,21 @@ if __name__ == "__main__":
             input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(
                 model.device
             )
-            confidence = subclassifier(input_ids=input_ids)
+            confidence = surrogate_classifier(input_ids=input_ids)
 
-            y_clf = float(confidence.detach().cpu().numpy()[0][0])
-
-            y_llm = map_y_pred(
-                clf_evaluator(
-                    [
-                        {
-                            "base": base,
-                            "attack": best_string_step,
-                            "append_strat": "suffix",
-                        }
-                    ]
-                )[0]
-            )
-            success = abs(y_llm - y_llm_base)
-            output = clf_evaluator.logger[-1].get("output", None)
+            y_clf = float(torch.sigmoid(confidence.detach()[0][0]))
 
             step_result = {
                 "step": step,
                 "attack": best_string_step,
                 "loss": best_loss_step,
-                "y_clf": y_clf,
-                "y_llm": y_llm,
-                "success": success,
-                "output": output,
             }
             step_results.append(step_result)
 
         prompt = config.prompt_manager.get_prompt(best_string)
         input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(model.device)
-        confidence = subclassifier(input_ids=input_ids)
-        y_clf = float(confidence.detach().cpu().numpy()[0][0])
-        y_llm = map_y_pred(
-            clf_evaluator(
-                [{"base": base, "attack": best_string, "append_strat": "suffix"}]
-            )[0]
-        )
-        output = clf_evaluator.logger[-1].get("output", None)
+        confidence = surrogate_classifier(input_ids=input_ids)
+        y_clf = torch.sigmoid(confidence).item()
 
         record = {
             "base": base,
@@ -360,22 +289,26 @@ if __name__ == "__main__":
             "append_strat": "suffix",
             "y_clf_base": y_clf_base,
             "y_clf": y_clf,
-            "y_llm_base": y_llm_base,
-            "y_llm": y_llm,
-            "llm_success": abs(y_llm - y_llm_base),
-            "output": output,
             "step_results": step_results,
             "attacks": strings,
             "losses": losses,
+            "time": elapsed_time,
+            "vram_low": vram_stats["low"],
+            "vram_high": vram_stats["high"],
         }
 
         records.append(record)
 
     results = {"metadata": metadata, "records": records}
 
+    if not os.path.exists(config.exp.output_dir):
+        os.makedirs(config.exp.output_dir)
+
     with open(
-        config.exp.output_path
-        + f'adv_transfer_clf_{model_tag}_{end_layer:02d}_layer{layer:02d}_gcg_{gcg_config.num_steps}steps_{gcg_config.topk}topk_{config.exp.dataset_path.split("/")[-1].replace(".json","")}_{config.exp.start:03d}_{config.exp.end:03d}.json',
+        os.path.join(
+            config.exp.output_dir,
+            f'gcg_surrogate_{model_tag}_{end_layer:02d}_layer{layer:02d}_gcg_{gcg_config.num_steps}steps_{gcg_config.topk}topk_{config.exp.dataset_path.split("/")[-1].replace(".json","")}_{config.exp.start:03d}_{config.exp.end:03d}.json',
+        ),
         "w",
     ) as f:
-        json.dump(results, f)
+        json.dump(results, f, indent=4)

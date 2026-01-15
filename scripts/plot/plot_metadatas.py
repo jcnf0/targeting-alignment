@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import seaborn as sns
 
-from clfextract.utils import savefig, MODELS, MODELS_MAP
+from clfextract.utils import MODELS, MODELS_MAP, savefig
 
 sns.set_style("whitegrid")
 
